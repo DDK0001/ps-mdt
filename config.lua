@@ -142,6 +142,18 @@ Config.Phone = {
 }
 
 
+-- Internal Affairs
+Config.IA = {
+    -- Anti-spam: how long a citizen must wait between filing complaints.
+    CooldownMs = 300000, -- 5 minutes
+
+    -- E-mail the complainant when their complaint changes status. Uses the phone
+    -- resource from Config.Phone; silently skipped if none is running.
+    NotifyComplainant = true,
+    MailSender = 'Internal Affairs',
+}
+
+
 -- Housing / Properties Integration
 -- The MDT shows the properties a citizen owns on their profile. Every housing
 -- resource stores this in a different table with different column names, so
@@ -361,6 +373,12 @@ Config.Impound = {
     -- Require the fee to be paid before a vehicle can be released.
     RequireFeePaid = true,
 
+    -- E-mail the owner when their vehicle is impounded, charged, or released.
+    -- The owner is usually nowhere near the vehicle when it happens, so an on-screen
+    -- notification they never see is worse than useless. Uses Config.Phone.
+    NotifyOwner = true,
+    MailSender  = 'Vehicle Impound Unit',
+
     -- Storage fee: grows for every day the vehicle sits in the lot, capped so it
     -- can never run away. Computed from the impound date, never accumulated by a
     -- timer, so it survives restarts and can't drift.
@@ -377,13 +395,24 @@ Config.Impound = {
         -- How far the officer may stand from the vehicle.
         MaxDistance = 6.0,
 
+        -- The officer documents the vehicle, then radios it in. Both steps are
+        -- cancellable: walking away aborts the impound and nothing is written.
+        Sequence = {
+            NotepadMs = 4500,   -- writing it up on the clipboard
+            RadioMs   = 6000,   -- calling the tow truck in
+        },
+
+        -- Once the paperwork is done the vehicle fades out and is removed.
+        FadeMs = 1500,
+
         Cleanup = {
             -- Payout for removing an unowned vehicle, randomised in this range.
             RewardMin   = 100,
             RewardMax   = 200,
-            Account     = 'bank',
+            Account     = 'cash',
             -- Anti-abuse: seconds between payouts, and how many an officer can
             -- earn per shift (resets when they go off duty / the server restarts).
+            -- everything is logged
             Cooldown    = 120,
             MaxPerShift = 20,
         },

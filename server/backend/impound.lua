@@ -36,6 +36,24 @@ local function isTruthy(v)
     return v == true or v == 1 or v == '1'
 end
 
+-- ── Owner e-mails ────────────────────────────────────────────────────────────
+-- The owner is almost never standing next to the car when it gets impounded, and
+-- may well be offline. An on-screen notification they never see is worse than
+-- useless, so they get an e-mail instead — it waits for them.
+
+local function mailOwner(citizenid, subject, body)
+    if not citizenid then return end
+    if not impoundCfg().NotifyOwner then return end
+    if not SendCitizenMail then return end
+
+    SendCitizenMail(
+        citizenid,
+        impoundCfg().MailSender or 'Vehicle Impound Unit',
+        subject,
+        body
+    )
+end
+
 -- ── Storage fee ──────────────────────────────────────────────────────────────
 -- Derived from the impound date rather than accumulated by a timer: that makes it
 -- restart-proof, impossible to drift, and correct even for rows written before
@@ -178,6 +196,24 @@ local function doImpound(src, payload)
     -- Recovering the car closes any active BOLO on it.
     local boloClosed = clearVehicleBolo(plate)
 
+    -- Tell the owner. They had no way of knowing before this.
+    local lotForMail = getLot(lotId)
+    local storageCfg = impoundCfg().Storage or {}
+    local body = ('Your vehicle %s has been impounded.'):format(plate)
+    body = body .. ('\n\nReason: %s'):format(reason)
+    body = body .. ('\nHeld at: %s'):format((lotForMail and lotForMail.label) or lotId)
+    if fee > 0 then
+        body = body .. ('\nRelease fee: $%d'):format(fee)
+        if (storageCfg.PerDay or 0) > 0 then
+            body = body .. ('\nStorage: $%d per day, up to %d days')
+                :format(storageCfg.PerDay, storageCfg.MaxDays or 0)
+        end
+    else
+        body = body .. '\nRelease fee: none'
+    end
+    body = body .. '\n\nSpeak to an officer to arrange release. The longer it stays with us, the more it will cost you.'
+    mailOwner(vehicle.citizenid, ('Vehicle impounded — %s'):format(plate), body)
+
     if ps.auditLog then
         local lot = getLot(lotId)
         ps.auditLog(src, 'vehicle_impounded', 'vehicle', plate, {
@@ -256,7 +292,17 @@ ps.registerCallback(resourceName .. ':server:payImpoundFee', function(source, pa
         return { success = false, message = 'Owner could not cover the fee' }
     end
 
+    -- Money leaving an account warrants immediate feedback, so the on-screen note
+    -- stays; the e-mail is the receipt they can actually go back and read.
     ps.notify(ownerSrc, ('$%d impound fee charged for %s'):format(owed, plate), 'error')
+
+    local receipt = ('$%d has been charged for the release of %s.'):format(owed, plate)
+    if storage > 0 then
+        receipt = receipt .. ('\n\nImpound fee: $%d\nStorage: $%d\nTotal: $%d')
+            :format(row.fee or 0, storage, owed)
+    end
+    receipt = receipt .. '\n\nYour vehicle can now be released.'
+    mailOwner(vehicle.citizenid, ('Impound fee paid — %s'):format(plate), receipt)
 
     if ps.auditLog then
         ps.auditLog(src, 'vehicle_impound_fee_paid', 'vehicle', plate, {
@@ -318,16 +364,12 @@ ps.registerCallback(resourceName .. ':server:releaseImpound', function(source, p
         WHERE id = ?
     ]], { os.time(), cid, officerName, row.id })
 
-    -- Let the owner know it's waiting for them.
-    if vehicle.citizenid then
-        local owner = ps.getPlayerByIdentifier(vehicle.citizenid)
-        local ownerSrc = owner and (owner.PlayerData and owner.PlayerData.source or owner.source) or nil
-        if ownerSrc then
-            ps.notify(ownerSrc,
-                ('Your vehicle %s has been released — it is back in your garage'):format(plate),
-                'success')
-        end
-    end
+    -- Let the owner know it's waiting for them. By e-mail, so it also reaches them
+    -- if they were offline when it was released.
+    mailOwner(vehicle.citizenid,
+        ('Vehicle released — %s'):format(plate),
+        ('Your vehicle %s has been released from the impound lot.\n\nIt is back in your garage.')
+            :format(plate))
 
     if ps.auditLog then
         ps.auditLog(src, 'vehicle_released', 'vehicle', plate, {
@@ -346,7 +388,7 @@ end)
 -- ─────────────────────────────────────────────────────────────────────────────
 -- On-site impound
 --
--- The officer runs /mdtimpound next to a car. Everything the client claims is
+-- The officer runs /impound next to a car. Everything the client claims is
 -- re-checked here against the real entity: a client that lies about a net id, a
 -- plate or the distance gets nothing.
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -360,27 +402,35 @@ local function onSiteCfg()
     return (impoundCfg().OnSite) or {}
 end
 
--- Pay an officer. The ps bridge is an external resource and only removeMoney is
--- used anywhere else in the MDT, so addMoney may or may not exist — fall back to
--- the framework rather than erroring on a bridge that doesn't provide it.
+-- Pay an officer. ps.addMoney doesn't exist on the bridge, so go through the
+-- framework player object — the same object charges.lua already gets back from
+-- ps.getPlayerByIdentifier, which is proven to work here.
 local function payOfficer(src, account, amount, reason)
     if amount <= 0 then return true end
 
-    if type(ps) == 'table' and type(ps.addMoney) == 'function' then
-        local ok, res = pcall(ps.addMoney, src, account, amount, reason)
-        if ok and res ~= false then return true end
+    local cid = ps.getIdentifier and ps.getIdentifier(src) or nil
+    local Player = cid and ps.getPlayerByIdentifier(cid) or nil
+
+    if Player and Player.Functions and Player.Functions.AddMoney then
+        local ok = pcall(Player.Functions.AddMoney, account, amount, reason)
+        if ok then return true end
     end
 
-    -- QBCore / QBX both expose AddMoney on the player object.
+    -- Fall back to the core export if the bridge handed us something unexpected.
     local ok = pcall(function()
         local core = GetResourceState('qbx_core') == 'started'
             and exports['qbx_core']:GetCoreObject()
             or exports['qb-core']:GetCoreObject()
-        local Player = core.Functions.GetPlayer(src)
-        if Player and Player.Functions and Player.Functions.AddMoney then
-            Player.Functions.AddMoney(account, amount, reason)
+        local P = core.Functions.GetPlayer(src)
+        if not P or not P.Functions or not P.Functions.AddMoney then
+            error('no usable player object')
         end
+        P.Functions.AddMoney(account, amount, reason)
     end)
+
+    if not ok then
+        ps.warn(('[impound] could not pay $%d to source %s'):format(amount, tostring(src)))
+    end
     return ok
 end
 
@@ -409,6 +459,37 @@ local function resolveVehicle(src, netId)
 
     return entity, nil
 end
+
+-- The vehicle isn't deleted the instant the record is written: it stays put for the
+-- moment it takes the client to fade it out. This watchdog is the safety net for a
+-- client that crashes, alt-F4s or never reports back — the world can never keep a
+-- car that the database calls impounded.
+local REMOVAL_GRACE = 30 -- seconds
+local function scheduleRemoval(netId, seconds)
+    netId = tonumber(netId)
+    if not netId then return end
+
+    CreateThread(function()
+        Wait((seconds or 60) * 1000)
+        local entity = NetworkGetEntityFromNetworkId(netId)
+        if entity and entity ~= 0 and DoesEntityExist(entity) then
+            DeleteEntity(entity)
+        end
+    end)
+end
+
+-- The client finished fading the vehicle out: take it out of the world for good.
+RegisterNetEvent(resourceName .. ':server:removeVehicle', function(netId)
+    local src = source
+    if not CheckAuth(src) then return end
+    netId = tonumber(netId)
+    if not netId then return end
+
+    local entity = NetworkGetEntityFromNetworkId(netId)
+    if entity and entity ~= 0 and DoesEntityExist(entity) then
+        DeleteEntity(entity)
+    end
+end)
 
 -- Is a real player sitting in this vehicle? NPC occupants are fine; players are not.
 local function hasPlayerOccupant(entity)
@@ -486,8 +567,8 @@ ps.registerCallback(resourceName .. ':server:impoundOnSite', function(source, pa
         return result or { success = false, message = 'Impound failed' }
     end
 
-    -- Only remove the car once the record actually exists.
-    if DoesEntityExist(entity) then DeleteEntity(entity) end
+    -- Give the client a moment to fade it out; this is the backstop if it never does.
+    scheduleRemoval(payload.netId, REMOVAL_GRACE)
 
     return result
 end)
@@ -534,9 +615,9 @@ ps.registerCallback(resourceName .. ':server:cleanupVehicle', function(source, p
     local maxPerShift = cfg.MaxPerShift or 0
     local capped = maxPerShift > 0 and state.count >= maxPerShift
 
-    -- The car is removed either way — the cap only stops the payout, so an officer
-    -- can still clear the streets after hitting the limit.
-    if DoesEntityExist(entity) then DeleteEntity(entity) end
+    -- The car goes either way — the cap only stops the payout, so an officer can
+    -- still clear the streets after hitting the limit.
+    scheduleRemoval(payload.netId, REMOVAL_GRACE)
 
     state.last = now
     state.count = state.count + 1
@@ -569,8 +650,8 @@ ps.registerCallback(resourceName .. ':server:cleanupVehicle', function(source, p
         reward  = reward,
         capped  = capped,
         message = capped
-            and 'Vehicle removed — shift payout limit reached'
-            or  ('Vehicle removed — earned $%d'):format(reward),
+            and 'Towed away — shift payout limit reached'
+            or  ('Towed away — earned $%d'):format(reward),
     }
 end)
 
