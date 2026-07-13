@@ -261,9 +261,9 @@ function GetVehicleOwner(plate)
         return "Unknown Owner"
     end
 
-    -- Sanitise plate input
-    plate = string.gsub(plate, "%s+", "") -- Remove spaces
-    plate = string.upper(plate) -- Convert to uppercase
+    -- Sanitise plate input. Trim the padding, keep spaces inside the plate.
+    plate = NormalizePlate(plate)
+    if not plate then return nil end
     ps.debug('Fetching vehicle owner for plate: ' .. plate)
 
     -- Fetch the owner
@@ -489,6 +489,333 @@ function GetCitizenPhoneNumber(citizenid, fallback)
 end
 
 -- Convenience export so other resources can reuse the same resolution.
+-- ── Callsigns ────────────────────────────────────────────────────────────────
+-- The range an officer may pick from comes from their job, falling back to their job
+-- type. There is no global default on purpose: an unconfigured job is a mistake, and
+-- silently issuing numbers from some arbitrary range would hide it. Every path below
+-- returns an explanation instead.
+
+--- Flatten a Reserved/Blocked list into a plain [number] = reason map.
+---
+--- ONLY the list form is accepted:
+---   { { n = 7, why = '…' }, { from = 90, to = 99, why = '…' } }
+---
+--- The obvious-looking [7] = '…' map form is rejected on purpose, because mixing it
+--- with a range is a silent data-loss trap:
+---
+---   { [1] = 'Chief of Police', { from = 2, to = 5, why = 'Command staff' } }
+---
+--- A keyless entry in Lua IS index 1, so the range overwrites 'Chief of Police' while
+--- the config is being parsed. By the time any code here runs, the string no longer
+--- exists — it cannot be detected, only prevented. So the shape that allows it is not
+--- accepted at all, and the error says exactly what to write instead.
+--- @return table map, string|nil problem
+local function expandCallsignRules(rules, label)
+    local out = {}
+    if type(rules) ~= 'table' then return out, nil end
+
+    for key, value in pairs(rules) do
+        if type(value) == 'table' then
+            if value.n ~= nil then
+                local n = tonumber(value.n)
+                if not n then
+                    return out, ('a %s entry has a non-numeric `n`'):format(label)
+                end
+                out[n] = value.why or label
+            else
+                local from, to = tonumber(value.from), tonumber(value.to)
+                if not from or not to then
+                    return out, ('a %s entry needs either `n`, or `from` and `to`'):format(label)
+                end
+                if to < from then
+                    return out, ('a %s range has `to` below `from`'):format(label)
+                end
+                for n = from, to do
+                    out[n] = value.why or label
+                end
+            end
+        else
+            return out, (
+                '%s uses the old [%s] = \'…\' form. Write it as { n = %s, why = \'…\' } — '
+                .. 'the bracket form silently loses entries when a range is added next to it, '
+                .. 'because a keyless range takes index 1 and overwrites [1]'
+            ):format(label, tostring(key), tostring(key))
+        end
+    end
+
+    return out, nil
+end
+
+--- Resolve the callsign block for a job.
+--- @return table|nil cfg, string|nil problem
+function CallsignConfigFor(jobName, jobType)
+    local root = (Config and Config.Callsigns) or {}
+
+    -- A job block replaces the job-type block outright; it is not merged into it.
+    local cfg = jobName and (root.Jobs or {})[jobName] or nil
+    local source = cfg and ('job "' .. tostring(jobName) .. '"') or nil
+
+    if not cfg then
+        cfg = jobType and (root.JobTypes or {})[jobType] or nil
+        source = cfg and ('job type "' .. tostring(jobType) .. '"') or nil
+    end
+
+    if not cfg then
+        return nil, ('No callsign range is configured for job "%s" (type "%s"). Add it to Config.Callsigns.')
+            :format(tostring(jobName or '?'), tostring(jobType or '?'))
+    end
+
+    local minN, maxN = tonumber(cfg.Min), tonumber(cfg.Max)
+    if not minN or not maxN then
+        return nil, ('The callsign block for %s is missing Min or Max.'):format(source)
+    end
+    if maxN < minN then
+        return nil, ('The callsign block for %s has Max below Min.'):format(source)
+    end
+
+    local reserved, rErr = expandCallsignRules(cfg.Reserved, 'Reserved')
+    if rErr then
+        return nil, ('The callsign block for %s is invalid: %s'):format(source, rErr)
+    end
+
+    local blocked, bErr = expandCallsignRules(cfg.Blocked, 'Blocked')
+    if bErr then
+        return nil, ('The callsign block for %s is invalid: %s'):format(source, bErr)
+    end
+
+    -- Blocked wins over Reserved: "nobody" is a stronger statement than "somebody with
+    -- the permission". Listing a number in both is a mistake worth pointing at.
+    for n in pairs(blocked) do
+        if reserved[n] then
+            return nil, ('The callsign block for %s lists %d as both Reserved and Blocked.')
+                :format(source, n)
+        end
+    end
+
+    return {
+        Min      = minN,
+        Max      = maxN,
+        Pad      = tonumber(cfg.Pad) or 0,
+        Prefix   = cfg.Prefix or '',
+        PageSize = tonumber(cfg.PageSize) or 20,
+        Reserved = reserved,
+        Blocked  = blocked,
+        Source   = source,
+    }, nil
+end
+
+--- The block that applies to a connected player.
+--- @return table|nil cfg, string|nil problem
+function CallsignConfigForPlayer(src)
+    local jobName = ps.getJobName and ps.getJobName(src) or nil
+    local jobType = ps.getJobType and ps.getJobType(src) or nil
+    return CallsignConfigFor(jobName, jobType)
+end
+
+--- Render a number the way its block says it should look: 7 → "L-007".
+function FormatCallsign(n, cfg)
+    if not cfg then return tostring(n) end
+    local pad = tonumber(cfg.Pad) or 0
+    local body = pad > 0 and ('%0' .. pad .. 'd'):format(n) or tostring(n)
+    return (cfg.Prefix or '') .. body
+end
+
+--- May this officer hand out callsigns marked reserved?
+--- Separate from roster_manage_officers on purpose: an FTO can be trusted to give a
+--- recruit a number without also being able to hand out the Chief's.
+function CanAssignReservedCallsign(src)
+    return CheckPermission(src, 'roster_callsign_reserved') == true
+end
+
+--- Is this a callsign the given citizen is allowed to take?
+--- The picker only offers valid boxes, but a client can send anything.
+--- @return boolean ok, string|nil message, string|nil reservedReason
+function ValidateCallsignPick(src, callsign, citizenid)
+    callsign = tostring(callsign or '')
+    if callsign == '' then return false, 'Missing callsign' end
+
+    local cfg, problem = CallsignConfigForPlayer(src)
+    if not cfg then return false, problem end
+
+    local matched
+    for n = cfg.Min, cfg.Max do
+        if FormatCallsign(n, cfg) == callsign then matched = n break end
+    end
+    if not matched then
+        return false, ('%s is outside the range configured for %s'):format(callsign, cfg.Source)
+    end
+
+    -- Blocked first, and it is absolute. No permission unlocks it — the config has
+    -- said this number is not to be issued, and that isn't a matter of rank.
+    local blockedWhy = (cfg.Blocked or {})[matched]
+    if blockedWhy then
+        return false, ('%s is blocked (%s) and cannot be assigned to anyone')
+            :format(callsign, tostring(blockedWhy))
+    end
+
+    -- Reserved callsigns are not off-limits to everyone — they're off-limits to anyone
+    -- without the permission for them.
+    local why = (cfg.Reserved or {})[matched]
+    if why and not CanAssignReservedCallsign(src) then
+        return false, ('%s is reserved (%s) and you are not authorised to assign it')
+            :format(callsign, tostring(why))
+    end
+
+    -- Held by somebody else?
+    --
+    -- A callsign lives in two places: mdt_profiles.callsign and the player's metadata.
+    -- Checking only the profile table left a hole — a callsign set outside the MDT (or
+    -- on a player whose profile row was never filled in) looked free here while the
+    -- officer was already using it in game. Both are checked, and the holder is named
+    -- rather than left as a mystery.
+    local holder = CallsignHolder(callsign, citizenid)
+    if holder then
+        return false, ('%s is already held by %s'):format(callsign, holder)
+    end
+
+    return true, nil, why
+end
+
+--- Normalise a number plate for lookups and storage.
+---
+--- GetVehicleNumberPlateText always returns 8 characters, PADDED WITH TRAILING SPACES.
+--- Code around the resource dealt with that by stripping every space — which also
+--- destroys the spaces INSIDE a plate, so "LS 12345" became "LS12345" and matched
+--- nothing in player_vehicles. Trim the padding; keep the plate.
+---
+--- Trailing spaces need no special handling in SQL either: the plate columns use a
+--- PAD SPACE collation, so 'ABC123' = 'ABC123  ' already compares equal.
+--- @param plate string|nil
+--- @return string|nil  the trimmed, uppercased plate, or nil if there's nothing left
+function NormalizePlate(plate)
+    if type(plate) ~= 'string' then return nil end
+    plate = plate:upper():gsub('^%s+', ''):gsub('%s+$', '')
+    return plate ~= '' and plate or nil
+end
+
+--- SetMetaData only updates the player in memory; the `players.metadata` column is
+--- rewritten on the next autosave or logout. Anything that reads that column in the
+--- meantime — including the callsign uniqueness check — sees the OLD value. Writing the
+--- live metadata straight back keeps the two in step. The snapshot is identical to
+--- what's in memory, so the next autosave rewrites the same value and nothing is lost.
+function PersistLiveMetadata(Player, citizenid)
+    if not (Player and Player.PlayerData and Player.PlayerData.metadata and citizenid) then return end
+    local ok, encoded = pcall(json.encode, Player.PlayerData.metadata)
+    if ok and encoded then
+        MySQL.update.await('UPDATE players SET metadata = ? WHERE citizenid = ?', { encoded, citizenid })
+    end
+end
+
+--- Who holds this callsign, other than `exceptCitizenid`?
+--- @return string|nil holderName  nil when nobody holds it
+function CallsignHolder(callsign, exceptCitizenid)
+    exceptCitizenid = exceptCitizenid or ''
+
+    local row = MySQL.single.await([[
+        SELECT fullname, citizenid
+        FROM mdt_profiles
+        WHERE callsign = ? AND citizenid != ?
+        LIMIT 1
+    ]], { callsign, exceptCitizenid })
+    if row then
+        return (row.fullname and row.fullname ~= '' and row.fullname) or row.citizenid
+    end
+
+    -- Second home: the framework's own metadata. Worth checking, because a callsign set
+    -- outside the MDT never reaches mdt_profiles.
+    --
+    -- But only for officers the profile table says nothing about. If their profile
+    -- already names a DIFFERENT callsign, the metadata value is stale — and treating a
+    -- stale value as a live claim would lock that number away from everybody else.
+    local meta = MySQL.single.await([[
+        SELECT p.citizenid,
+               CONCAT(
+                   JSON_UNQUOTE(JSON_EXTRACT(p.charinfo, '$.firstname')), ' ',
+                   JSON_UNQUOTE(JSON_EXTRACT(p.charinfo, '$.lastname'))
+               ) AS fullname
+        FROM players p
+        LEFT JOIN mdt_profiles pr ON pr.citizenid = p.citizenid
+        WHERE JSON_UNQUOTE(JSON_EXTRACT(p.metadata, '$.callsign')) = ?
+          AND p.citizenid != ?
+          AND (pr.callsign IS NULL OR pr.callsign = '' OR pr.callsign = ?)
+        LIMIT 1
+    ]], { callsign, exceptCitizenid, callsign })
+    if meta then
+        return (meta.fullname and meta.fullname ~= '' and meta.fullname) or meta.citizenid
+    end
+
+    return nil
+end
+
+-- One-off repair. Until now SetMetaData was never pushed to the players table, so a
+-- reassigned officer could keep their OLD callsign in players.metadata indefinitely —
+-- which is why the picker attributed a stale number to them. mdt_profiles is the store
+-- the MDT actually writes, so it wins; metadata is brought back into line with it.
+AddEventHandler('onResourceStart', function(res)
+    if res ~= GetCurrentResourceName() then return end
+
+    local rows = MySQL.query.await([[
+        SELECT p.citizenid,
+               pr.callsign AS profile_callsign,
+               JSON_UNQUOTE(JSON_EXTRACT(p.metadata, '$.callsign')) AS meta_callsign
+        FROM players p
+        INNER JOIN mdt_profiles pr ON pr.citizenid = p.citizenid
+        WHERE pr.callsign IS NOT NULL AND pr.callsign <> ''
+          AND JSON_UNQUOTE(JSON_EXTRACT(p.metadata, '$.callsign')) <> pr.callsign
+    ]], {}) or {}
+
+    if #rows == 0 then return end
+
+    for _, r in ipairs(rows) do
+        MySQL.update.await(
+            "UPDATE players SET metadata = JSON_SET(metadata, '$.callsign', ?) WHERE citizenid = ?",
+            { r.profile_callsign, r.citizenid }
+        )
+        ps.warn(('[callsigns] %s: metadata said "%s", profile says "%s" — corrected to the profile.')
+            :format(tostring(r.citizenid), tostring(r.meta_callsign), tostring(r.profile_callsign)))
+    end
+
+    ps.warn(('[callsigns] Reconciled %d stale callsign(s) in player metadata.'):format(#rows))
+end)
+
+-- Check every configured callsign block once, on start. A bad range or a number
+-- listed as both Reserved and Blocked otherwise only surfaces the day somebody opens
+-- the picker and finds it broken.
+AddEventHandler('onResourceStart', function(res)
+    if res ~= GetCurrentResourceName() then return end
+
+    local root = (Config and Config.Callsigns) or {}
+    local function check(tbl, kind)
+        for key, block in pairs(tbl or {}) do
+            local cfg, problem = CallsignConfigFor(
+                kind == 'job' and key or nil,
+                kind == 'jobtype' and key or nil
+            )
+            if not cfg then
+                ps.warn(('[callsigns] %s "%s": %s'):format(kind, tostring(key), tostring(problem)))
+            else
+                -- A number outside the range can never be picked, so listing it there
+                -- means somebody meant something else.
+                for n in pairs(cfg.Reserved) do
+                    if n < cfg.Min or n > cfg.Max then
+                        ps.warn(('[callsigns] %s "%s": Reserved %d is outside %d-%d and can never apply.')
+                            :format(kind, tostring(key), n, cfg.Min, cfg.Max))
+                    end
+                end
+                for n in pairs(cfg.Blocked) do
+                    if n < cfg.Min or n > cfg.Max then
+                        ps.warn(('[callsigns] %s "%s": Blocked %d is outside %d-%d and can never apply.')
+                            :format(kind, tostring(key), n, cfg.Min, cfg.Max))
+                    end
+                end
+            end
+        end
+    end
+
+    check(root.JobTypes, 'jobtype')
+    check(root.Jobs, 'job')
+end)
+
 --- Send an e-mail to a citizen through the configured phone resource.
 --- Mirrors the lb-phone flow court.lua already uses: resolve the citizen's number,
 --- ask the phone for the mail address behind it, then send.

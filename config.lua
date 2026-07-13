@@ -32,7 +32,7 @@ Config.Sharing = {
             'warrants'
         },
         departments = {
-            'lspd',
+            'police',
             'bcso',
             'sahp'
         }
@@ -47,7 +47,7 @@ Config.Sharing = {
                 'gov'
             },
             targets = {
-                'lspd',
+                'police',
                 'bcso',
                 'sahp'
             },
@@ -139,6 +139,109 @@ Config.Phone = {
     -- Court messaging (uses the same Resource above)
     SmsSenderNumber = 'SA-COURT',                 -- "from" number shown on reminder SMS (any string lb-phone accepts)
     MailSender      = 'San Andreas Judicial System', -- sender shown in the recipient's inbox
+}
+
+
+-- Callsigns
+-- Officers pick a callsign from a grid rather than typing one, so the range has to be
+-- defined somewhere. There is deliberately NO global fallback: a job with no range
+-- configured is a configuration mistake, and the MDT says so instead of quietly
+-- handing out numbers from a range nobody chose.
+--
+-- Lookup order for an officer:
+--   1. Callsigns.Jobs[<job name>]      — e.g. 'lspd'
+--   2. Callsigns.JobTypes[<job type>]  — e.g. 'leo'
+--   3. nothing → the picker refuses and tells you which job is unconfigured
+--
+-- A Jobs entry replaces the JobTypes entry completely; it is not merged into it. If
+-- one department needs its own block of numbers, spell that block out in full.
+--
+-- Per block:
+--   Min, Max   (required) the pickable range
+--   Pad        digits to pad to: 2 → 01..99, 3 → 001..999. 0 or omitted = no padding
+--   Prefix     e.g. 'L-' gives L-01. Omitted = bare numbers
+--   PageSize   boxes shown before "Load more" (default 20)
+--   Reserved   restricted, not forbidden: only somebody with the
+--              roster_callsign_reserved permission may hand these out
+--   Blocked    forbidden outright. No permission unlocks a blocked callsign — it is
+--              the config saying "this number does not exist". Use it for numbers the
+--              radio uses, numbers you're holding back, or ones you never want issued.
+--
+-- Reserved and Blocked take a LIST of entries — single numbers and ranges:
+--   Reserved = {
+--       { n = 1, why = 'Chief of Police' },             -- one number
+--       { from = 2, to = 5, why = 'Command staff' },    -- a range
+--   }
+--
+-- The bracket form ([1] = 'Chief of Police') is NOT accepted, and that's deliberate.
+-- In Lua a keyless entry IS index 1, so writing
+--       { [1] = 'Chief of Police', { from = 2, to = 5, why = 'Command staff' } }
+-- makes the range overwrite the Chief while the file is being read — the string is
+-- gone before any code can see it, so it can't be detected, only prevented. The
+-- resource therefore refuses the bracket form outright and tells you what to write.
+Config.Callsigns = {
+    JobTypes = {
+        leo = {
+            Min = 1,
+            Max = 100,
+            Pad = 3,
+            Prefix = 'PD-',
+            PageSize = 24,
+
+            -- Restricted: needs roster_callsign_reserved.
+            Reserved = {
+                { n = 1, why = 'Chief of Police' },
+                { from = 2, to = 5, why = 'Command staff' },
+            },
+
+            -- Forbidden: nobody, ever.
+            Blocked = {
+                -- { n = 99, why = 'Dispatch uses this on the radio' },
+                { from = 90, to = 100, why = 'Held back for future units' },
+            },
+        },
+
+        ems = {
+            Min = 1,
+            Max = 60,
+            Pad = 2,
+            Prefix = 'M-',
+            PageSize = 24,
+            Reserved = {
+                { n = 1, why = 'Chief of Medicine' },
+            },
+            Blocked = {
+                { from = 50, to = 60, why = 'Held back for future units' },
+            },
+        },
+
+        doj = {
+            Min = 1,
+            Max = 30,
+            Pad = 2,
+            Prefix = 'DOJ-',
+            PageSize = 24,
+            Reserved = {
+                { n = 1, why = 'Chief of Justice' },
+            },
+            Blocked = {
+                { from = 2, to = 5, why = 'Held back for future units' },
+            },
+        },
+    },
+
+    -- Optional. Anything in here overrides the job type block entirely for that one job.
+    Jobs = {
+        -- bcso = {
+        --     Min = 200,
+        --     Max = 299,
+        --     Pad = 3,
+        --     Prefix = 'S-',
+        --     PageSize = 24,
+        --     Reserved = { { n = 200, why = 'Sheriff' } },
+        --     Blocked  = { { from = 290, to = 299, why = 'Reserved for air units' } },
+        -- },
+    },
 }
 
 
@@ -391,6 +494,10 @@ Config.Impound = {
     },
     DefaultDuration = 'hold',
 
+    -- How many vehicles the lot view lists before the "Load more" button. A busy lot
+    -- otherwise renders every held vehicle at once and the modal scrolls forever.
+    LotPageSize = 10,
+
     -- E-mail the owner when their vehicle is impounded, charged, or released.
     -- The owner is usually nowhere near the vehicle when it happens, so an on-screen
     -- notification they never see is worse than useless. Uses Config.Phone.
@@ -440,7 +547,7 @@ Config.Impound = {
 -- Job Settings
 Config.PoliceJobType = "leo"
 Config.PoliceJobs = {
-    'lspd',
+    'police',
     'bcso',
     'sahp',
     'fib',
@@ -662,6 +769,7 @@ Config.ManagementPermissions = {
     -- Roster
     'roster_manage_certifications',
     'roster_manage_officers',
+    'roster_callsign_reserved',
     -- PPR
     'ppr_view',
     'ppr_manage',
