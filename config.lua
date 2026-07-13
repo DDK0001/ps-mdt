@@ -355,15 +355,19 @@ Config.Impound = {
 
     -- Impound reasons offered in the MDT, each with a default fee (the officer
     -- can still edit the fee when impounding).
+    -- `hold` is the duration id (see Durations below) that gets pre-selected when an
+    -- officer picks this reason. It's a recommendation, not a rule: the officer can
+    -- always change it before filing. Omit it and the reason falls back to
+    -- DefaultDuration.
     Reasons = {
-        { label = 'Evidence / Investigation', fee = 0 },
-        { label = 'Reckless Driving',         fee = 750 },
-        { label = 'Illegal Parking',          fee = 250 },
-        { label = 'Unregistered Vehicle',     fee = 500 },
-        { label = 'Stolen Vehicle Recovery',  fee = 0 },
-        { label = 'DUI',                      fee = 1500 },
-        { label = 'Illegal Modifications',    fee = 1000 },
-        { label = 'Abandoned Vehicle',        fee = 300 },
+        { label = 'Evidence / Investigation', fee = 0,    hold = 'hold' },
+        { label = 'Reckless Driving',         fee = 750,  hold = '1d' },
+        { label = 'Illegal Parking',          fee = 250,  hold = 'immediate' },
+        { label = 'Unregistered Vehicle',     fee = 500,  hold = 'immediate' },
+        { label = 'Stolen Vehicle Recovery',  fee = 0,    hold = 'immediate' },
+        { label = 'DUI',                      fee = 1500, hold = '3d' },
+        { label = 'Illegal Modifications',    fee = 1000, hold = '1d' },
+        { label = 'Abandoned Vehicle',        fee = 300,  hold = 'immediate' },
     },
 
     DefaultFee = 500,
@@ -372,6 +376,20 @@ Config.Impound = {
     FeeAccount = 'bank',
     -- Require the fee to be paid before a vehicle can be released.
     RequireFeePaid = true,
+
+    -- How long the vehicle is held before it may be released at all.
+    --   days = 0    → releasable straight away
+    --   days = n    → held for n days
+    --   days = nil  → held until an officer decides otherwise
+    -- The fee still has to be paid on top; the hold is about time, not money.
+    Durations = {
+        { id = 'immediate', label = 'Releasable immediately', days = 0 },
+        { id = '1d',        label = '1 day',                  days = 1 },
+        { id = '3d',        label = '3 days',                 days = 3 },
+        { id = '7d',        label = '7 days',                 days = 7 },
+        { id = 'hold',      label = 'Until an officer releases it' },
+    },
+    DefaultDuration = 'hold',
 
     -- E-mail the owner when their vehicle is impounded, charged, or released.
     -- The owner is usually nowhere near the vehicle when it happens, so an on-screen
@@ -634,6 +652,7 @@ Config.ManagementPermissions = {
     -- Impound
     'vehicle_impound',
     'vehicle_impound_release',
+    'vehicle_impound_override',
     -- Cameras & Bodycams
     'cameras_view',
     'bodycams_view',
