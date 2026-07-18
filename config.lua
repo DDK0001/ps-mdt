@@ -89,6 +89,17 @@ Config.Commands = {
         enabled = true, -- Enable/disable command (boolean)
         command = 'motd', -- Command to set message of the day (string)
     },
+    Status = {
+        enabled = true, -- Enable/disable command (boolean)
+        command = 'mdtstatus', -- /mdtstatus <id> [note...] (string)
+        -- No RegisterKeyMapping on purpose (it would add one entry per status
+        -- to everyone's GTA key-binding settings). Players who want a status
+        -- on a key bind it themselves via the F8 console, e.g.:
+        --   bind keyboard F5 "mdtstatus enroute"
+        --   bind keyboard F6 "mdtstatus onscene"
+        --   bind keyboard F7 "mdtstatus active"
+        -- (Run once; FiveM persists binds. `unbind keyboard F5` removes it.)
+    },
 }
 
 -- Dispatch Settings
@@ -192,8 +203,8 @@ Config.Callsigns = {
         leo = {
             Min = 1,
             Max = 100,
-            Pad = 3,
-            Prefix = 'PD-',
+            Pad = 2,
+            Prefix = '1A',
             PageSize = 24,
 
             -- Restricted: needs roster_callsign_reserved.
@@ -205,7 +216,7 @@ Config.Callsigns = {
             -- Forbidden: nobody, ever.
             Blocked = {
                 -- { n = 99, why = 'Dispatch uses this on the radio' },
-                { from = 90, to = 98, why = 'Held back for future units' },
+                { from = 90, to = 100, why = 'Held back for future units' },
             },
         },
 
@@ -843,21 +854,50 @@ Config.Bodycam = {
 -- `icon` : optional emoji/short glyph shown next to the label (purely visual)
 -- To add a new status, just append a new entry — no other file needs to change.
 Config.OfficerStatus = {
+    -- `dashboard` controls whether the status appears as a chip in the
+    -- dashboard's dispatch breakdown widget. Officers in a hidden status
+    -- still count toward the "online" total — only the chip is omitted.
+    -- Omitting the key entirely counts as `dashboard = true`.
     list = {
-        { id = 'active',      label = 'Available',        color = '#22C55E', icon = '●' },
-        { id = 'busy',        label = 'Busy',             color = '#F59E0B', icon = '●' },
-        { id = 'enroute',     label = 'En Route',         color = '#3B82F6', icon = '●' },
-        { id = 'onscene',     label = 'On Scene',         color = '#06B6D4', icon = '●' },
-        { id = 'break',       label = 'Meal Break',       color = '#8B5CF6', icon = '●' },
-        { id = 'training',    label = 'Training',         color = '#0EA5E9', icon = '●' },
-        { id = 'unavailable', label = 'Unavailable',      color = '#6B7280', icon = '●' },
+        { id = 'active',      label = 'Available',        color = '#22C55E', icon = '●', dashboard = true },
+        { id = 'busy',        label = 'Busy',             color = '#F59E0B', icon = '●', dashboard = true },
+        { id = 'enroute',     label = 'En Route',         color = '#3B82F6', icon = '●', dashboard = false },
+        { id = 'onscene',     label = 'On Scene',         color = '#06B6D4', icon = '●', dashboard = true },
+        { id = 'break',       label = 'Meal Break',       color = '#8B5CF6', icon = '●', dashboard = false },
+        { id = 'training',    label = 'Training',         color = '#0EA5E9', icon = '●', dashboard = false },
+        { id = 'unavailable', label = 'Unavailable',      color = '#6B7280', icon = '●', dashboard = false },
     },
     -- Status id assumed for any officer who has never set one.
     Default = 'active',
     -- Max length for the optional free-text note (e.g. "Traffic Stop").
-    MaxNoteLength = 60,
+    MaxNoteLength = 30,
     -- Minimum ms between two status changes from the same player (anti-spam).
     ChangeCooldownMs = 1500,
+
+    -- ── Automatic status from dispatch lifecycle ────────────────────────────
+    -- Attach to a call        -> EnRouteStatus
+    -- Arrive at call coords   -> OnSceneStatus
+    -- Detach / call dismissed -> RevertStatus
+    -- The automation NEVER fights the officer: it only replaces statuses
+    -- listed in Overridable, and a manual status change while en route /
+    -- on scene disengages the automation for that call entirely.
+    Auto = {
+        Enabled = true,
+        EnRouteStatus = 'enroute',
+        OnSceneStatus = 'onscene',
+        RevertStatus  = 'active',
+        -- Statuses the automation is allowed to replace on assignment.
+        -- Deliberate away-states (break/training/unavailable) are preserved:
+        -- assigning such an officer leaves their status untouched.
+        Overridable = { 'active', 'busy', 'enroute', 'onscene' },
+        -- Metres (2D) from the call coords that count as "arrived".
+        OnSceneRadius = 100.0,
+        -- Client proximity poll interval while en route (ms).
+        ArrivalCheckMs = 5000,
+        -- Failsafe: calls that are never closed/detached (e.g. provider call
+        -- silently expired) auto-revert after this many minutes. 0 = disabled.
+        MaxEngagementMinutes = 45,
+    },
 }
 
 -- Optional defaults for role permissions by job/grade
@@ -869,6 +909,35 @@ Config.OfficerStatus = {
 --     }
 -- }
 Config.PermissionDefaults = Config.PermissionDefaults or {}
+
+-- ---------------------------------------------------------------------------
+--  Applications (civilian job applications)
+-- ---------------------------------------------------------------------------
+-- Civilians apply for a department in-game via a command. Each department has its own
+-- command so the applicant lands straight on the right form. The QUESTIONS themselves
+-- are NOT configured here — they're managed live in the MDT (Management → Applications),
+-- so a department can change what it asks without a config edit or restart.
+Config.Applications = {
+    Enabled = true,
+
+    -- One command per department. `id` must match the department id used everywhere else
+    -- (the job name is the natural choice). `label` is the form's title. `description` is
+    -- the chat autocomplete hint; omit it and it defaults to "Apply to <label>".
+    Departments = {
+        { id = 'police',    command = 'applypolice', label = 'LSPD Application', description = 'Apply to join the LSPD' },
+        { id = 'ambulance', command = 'applyems',    label = 'EMS Application',  description = 'Apply to join EMS' },
+        { id = 'doj',       command = 'applydoj',    label = 'DOJ Application',  description = 'Apply to join the DOJ' },
+    },
+
+    -- Anti-spam: how long a citizen must wait between submissions to the SAME department.
+    CooldownMs = 600000,   -- 10 minutes
+
+    -- Message the applicant on accept/reject (needs lb-phone or your mail bridge).
+    NotifyOnDecision = true,
+
+    -- Hard cap on a single answer's length, mirroring other free-text guards.
+    MaxAnswerLength = 2000,
+}
 
 -- ---------------------------------------------------------------------------
 --  Rate limiting
