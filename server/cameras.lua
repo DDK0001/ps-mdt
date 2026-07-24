@@ -593,6 +593,8 @@ function Camera.loadAllFromDatabase()
         return cameras
     end
 
+    local loadedCount, skippedCount = 0, 0
+
     for _, row in ipairs(results) do
         local okCoords, coords = pcall(json.decode, row.coords)
         local okRot, rotation = pcall(json.decode, row.rotation)
@@ -600,8 +602,23 @@ function Camera.loadAllFromDatabase()
             or coords.x == nil or coords.y == nil or coords.z == nil
             or rotation.x == nil or rotation.y == nil or rotation.z == nil then
             ps.warn(('Camera.loadAllFromDatabase - skipping cam_id %s: invalid coords/rotation JSON'):format(tostring(row.cam_id)))
+            skippedCount = skippedCount + 1
             goto continue
         end
+
+        -- JSON numbers can arrive as strings depending on how a row was written (the
+        -- in-game placer and a hand-edited row don't always agree). vector3() throws on a
+        -- string, and an uncaught throw here would abort the whole loop and leave the
+        -- registry empty — so coerce explicitly and skip the row if it can't be done.
+        local cx, cy, cz = tonumber(coords.x), tonumber(coords.y), tonumber(coords.z)
+        local rx, ry, rz = tonumber(rotation.x), tonumber(rotation.y), tonumber(rotation.z)
+        if not (cx and cy and cz and rx and ry and rz) then
+            ps.warn(('Camera.loadAllFromDatabase - skipping cam_id %s: non-numeric coords/rotation'):format(tostring(row.cam_id)))
+            skippedCount = skippedCount + 1
+            goto continue
+        end
+        coords = { x = cx, y = cy, z = cz }
+        rotation = { x = rx, y = ry, z = rz }
 
         local camera = Camera.createStatic(
             row.cam_id,
@@ -639,7 +656,15 @@ function Camera.loadAllFromDatabase()
                 -- first player load). On a live restart players may already be
                 -- online, so spawn right away in that case.
                 if GetNumPlayerIndices() > 0 then
-                    camera:spawn()
+                    -- A failed spawn must not abort the whole load. The camera still
+                    -- belongs in the registry either way: it stays visible in the MDT and
+                    -- remains a valid target, it just has no prop in the world.
+                    local okSpawn, spawnErr = pcall(function() camera:spawn() end)
+                    if not okSpawn then
+                        ps.warn(('Camera.loadAllFromDatabase - spawn failed for %s: %s')
+                            :format(tostring(row.cam_id), tostring(spawnErr)))
+                        camera.isSpawned = false
+                    end
                 else
                     camera.isSpawned = false
                 end
@@ -650,14 +675,23 @@ function Camera.loadAllFromDatabase()
 
             cameras[row.cam_id] = camera
             spawnedCameras[row.cam_id] = camera
+            loadedCount = loadedCount + 1
         else
             ps.error('Camera.loadAllFromDatabase - Failed to create camera ' .. row.cam_id)
+            skippedCount = skippedCount + 1
         end
 
         ::continue::
     end
 
-    --ps.info('Camera.loadAllFromDatabase - Loaded ' .. #cameras .. ' cameras from database')
+    -- Always report the outcome. A silent load that produced nothing was the hardest part
+    -- of this to diagnose — the count makes it obvious at a glance.
+    if skippedCount > 0 then
+        ps.warn(('Camera.loadAllFromDatabase - loaded %d camera(s), skipped %d')
+            :format(loadedCount, skippedCount))
+    else
+        ps.debug(('Camera.loadAllFromDatabase - loaded %d camera(s)'):format(loadedCount))
+    end
     return cameras
 end
 
@@ -904,7 +938,11 @@ RegisterNetEvent(resourceName .. ':server:deactivateCamera', function(camId)
     if camId == 'current' then
         camId = playerViewingCamera[playerId]
         if not camId then
-            ps.error('Camera deactivation failed - player is not viewing any camera:', playerId)
+            -- Benign race: the server can end a view itself (camera shot out, camera
+            -- deleted) and the client's fade-out takes a moment, during which the player
+            -- may also hit close. By then we've already cleared their record, so there is
+            -- simply nothing left to do — not an error.
+            ps.debug('deactivateCamera: nothing to deactivate for player', playerId)
             return
         end
     end
@@ -1488,7 +1526,23 @@ AddEventHandler('onResourceStart', function(startedResource)
         local count = 0
         for _ in pairs(loadedCameras) do count = count + 1 end
 
-        ps.debug('Loaded ' .. count .. ' cameras from database')
+        local restored = 0
+        for camId, camera in pairs(loadedCameras) do
+            if camera.isOnline == false then
+                camera.isOnline = true
+                if camera.saveToDatabase then
+                    pcall(function() camera:saveToDatabase() end)
+                end
+                restored = restored + 1
+                TriggerClientEvent(GetCurrentResourceName() .. ':client:cameraStatusChanged', -1, {
+                    camId = camId,
+                    isOnline = true,
+                })
+            end
+        end
+        if restored > 0 then
+            ps.info(('Camera restart: brought %d offline camera(s) back online'):format(restored))
+        end
 
         -- Live restart: players may already be online, so spawn deferred props now.
         if GetNumPlayerIndices() > 0 then
@@ -1542,3 +1596,116 @@ lib.addCommand(Config.CameraPlacer and Config.CameraPlacer.command or 'camerapla
 }, function(source)
     TriggerClientEvent(resourceName .. ':client:openCameraPlacer', source)
 end)
+-- ── Tamper support ───────────────────────────────────────────────────────────
+-- The camera registry (`spawnedCameras`) is deliberately file-local, so these two
+-- accessors are the only surface the tamper logic in server/backend/camera_tamper.lua
+-- needs. Everything else about a camera stays encapsulated here.
+
+--- The point a bullet has to hit for a camera to count as shot out.
+---
+--- Prop-backed cameras are shot at their PROP: `coords` is where the model
+--- physically stands, and that is the thing in the world a player can aim at.
+---
+--- Virtual cameras have no prop, so `coords` describes nothing anyone can see
+--- — on a camera placed by dragging the view around it is often a leftover
+--- from wherever the placer happened to stand. What a player actually sees
+--- and shoots at is the lens, i.e. the feed position. Matching those against
+--- `coords` meant hitting the visible camera did nothing while the real
+--- target sat somewhere else entirely.
+---@param camera table
+---@return vector3|nil
+local function cameraHitCoords(camera)
+    if camera.spawnsModel == false then
+        local feed = camera.feedCoords
+        if feed then return vector3(feed.x, feed.y, feed.z) end
+    end
+    return camera.coords
+end
+
+--- Same resolution, exposed for the tamper module so its audit entry and
+--- dispatch alert report where the camera actually is rather than a stored
+--- position a virtual camera never occupied.
+---@param camera table
+---@return vector3|nil
+function CameraHitCoords(camera)
+    return cameraHitCoords(camera)
+end
+
+--- Nearest ONLINE static camera within `radius` metres of `coords`.
+--- Prop cameras are matched on their prop, virtual ones on their feed.
+---@param coords vector3
+---@param radius number
+---@return string|nil camId, table|nil camera
+--- Returns the nearest online static camera and its distance. The camera is only
+--- returned when it falls inside `radius`, but the distance is reported either way so
+--- callers can log how close a miss was — the difference between "detection is broken"
+--- and "the radius is too tight".
+---@return string|nil camId, table|nil camera, number|nil nearestDist
+function FindOnlineCameraNear(coords, radius)
+    if not coords then return nil, nil, nil end
+    local bestId, bestCam, bestDist
+
+    for camId, camera in pairs(spawnedCameras) do
+        -- Only static cameras have a fixed position worth shooting at; bodycams and
+        -- dashcams move with their owner and are handled separately.
+        if camera.camType == Camera.types.static and camera.isOnline ~= false then
+            local target = cameraHitCoords(camera)
+            if target then
+                local dist = #(coords - target)
+                if not bestDist or dist < bestDist then
+                    bestId, bestCam, bestDist = camId, camera, dist
+                end
+            end
+        end
+    end
+
+    if bestDist and bestDist <= radius then
+        return bestId, bestCam, bestDist
+    end
+    return nil, nil, bestDist
+end
+
+--- Debug aid: what is actually in the camera registry right now? A tamper report that
+--- finds nothing is ambiguous — no cameras loaded, none of type static, or all offline —
+--- and this distinguishes the three.
+---@return string
+function DescribeCameraRegistry()
+    local total, static, online, withCoords = 0, 0, 0, 0
+    for _, camera in pairs(spawnedCameras) do
+        total = total + 1
+        if camera.camType == Camera.types.static then
+            static = static + 1
+            if camera.isOnline ~= false then online = online + 1 end
+            if camera.coords then withCoords = withCoords + 1 end
+        end
+    end
+    return ('registry: %d total, %d static, %d of those online, %d with coords')
+        :format(total, static, online, withCoords)
+end
+
+--- Take a camera offline for `ms`, then bring it back automatically.
+--- Persists so every MDT client sees the same state, and kicks any live viewers.
+---@param camId string
+---@param ms number
+---@return boolean success, table|nil camera
+function SetCameraOfflineFor(camId, ms)
+    local camera = spawnedCameras[camId]
+    if not camera or camera.isOnline == false then return false, nil end
+
+    camera.isOnline = false
+    if camera.saveToDatabase then pcall(function() camera:saveToDatabase() end) end
+
+    -- Anyone watching this feed loses it immediately.
+    if camera.deactivateAll then pcall(function() camera:deactivateAll() end) end
+
+    SetTimeout(ms, function()
+        -- Re-read from the registry: the camera may have been deleted while it was down.
+        local cam = spawnedCameras[camId]
+        if not cam then return end
+        cam.isOnline = true
+        if cam.saveToDatabase then pcall(function() cam:saveToDatabase() end) end
+        ps.debug(('Camera %s back online'):format(camId))
+    end)
+
+    return true, camera
+end

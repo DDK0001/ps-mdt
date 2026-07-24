@@ -27,10 +27,16 @@
 	let defaultTab = $state("last");
 	let reducedMotion = $state(false);
 
+	// Plate checks (radar / ANPR)
+	let plateCheckAlerts = $state(true);
+	let plateCheckIgnoreImpounds = $state(false);
+	let plateCheckCriticalOnly = $state(false);
+
 	// Dispatch
 	let autoStatusNotifications = $state(true);
 	let autoWaypoint = $state(true);
 	let assignmentNotifications = $state(true);
+	let bodycamAutoDuty = $state(true);
 
 	let saveStatus: string | null = $state(null);
 	let saveTimeout: ReturnType<typeof setTimeout> | null = null;
@@ -39,7 +45,7 @@
 	// topbar can show an "Unsaved changes" hint.
 	let savedSnapshot = $state("");
 	function snapshot(): string {
-		return JSON.stringify({ notificationSounds, uiZoom, defaultZoom, centerOnSelf, patrolZoneNotifications, autoStatusNotifications, autoWaypoint, assignmentNotifications, defaultTab, reducedMotion });
+		return JSON.stringify({ notificationSounds, uiZoom, defaultZoom, centerOnSelf, patrolZoneNotifications, autoStatusNotifications, autoWaypoint, assignmentNotifications, bodycamAutoDuty, defaultTab, reducedMotion , plateCheckAlerts, plateCheckIgnoreImpounds, plateCheckCriticalOnly });
 	}
 	let isDirty = $derived(savedSnapshot !== "" && snapshot() !== savedSnapshot);
 
@@ -108,6 +114,12 @@
 				notificationSounds: d.notificationSounds !== false,
 				autoWaypoint: d.autoWaypoint !== false,
 				assignmentNotifications: d.assignmentNotifications !== false,
+				bodycamAutoDuty: d.bodycamAutoDuty !== false,
+				// Plate-check alerts are decided server-side, so these travel
+				// on to the server from preferences.lua.
+				plateCheckAlerts: d.plateCheckAlerts !== false,
+				plateCheckIgnoreImpounds: d.plateCheckIgnoreImpounds === true,
+				plateCheckCriticalOnly: d.plateCheckCriticalOnly === true,
 			}),
 		}).catch(() => {});
 	}
@@ -116,9 +128,9 @@
 	// hidden via tab_hidden_* permissions. Falls back to the full list when
 	// authService isn't wired (e.g. dev preview).
 	let defaultTabOptions = $derived.by(() => {
-		// 'civilian' never reaches Settings (civilians get their own view), but
-		// the JobType union includes it — narrow for getTabsForJob's sake.
-		const jt = authService && authService.jobType !== "civilian" ? authService.jobType : "leo";
+		// getTabsForJob takes the full JobType and handles anything that is not
+		// leo/ems/doj itself, so the old narrowing dance is gone.
+		const jt = authService?.jobType ?? "leo";
 		return [
 			{ value: "last", label: "Last used tab", icon: "history" },
 			...getTabsForJob(jt)
@@ -167,8 +179,12 @@
 			if (data.centerOnSelf !== undefined) centerOnSelf = data.centerOnSelf;
 			if (data.patrolZoneNotifications !== undefined) patrolZoneNotifications = data.patrolZoneNotifications;
 			if (data.autoStatusNotifications !== undefined) autoStatusNotifications = data.autoStatusNotifications;
+			if (data.plateCheckAlerts !== undefined) plateCheckAlerts = data.plateCheckAlerts;
+			if (data.plateCheckIgnoreImpounds !== undefined) plateCheckIgnoreImpounds = data.plateCheckIgnoreImpounds;
+			if (data.plateCheckCriticalOnly !== undefined) plateCheckCriticalOnly = data.plateCheckCriticalOnly;
 			if (data.autoWaypoint !== undefined) autoWaypoint = data.autoWaypoint;
 			if (data.assignmentNotifications !== undefined) assignmentNotifications = data.assignmentNotifications;
+			if (data.bodycamAutoDuty !== undefined) bodycamAutoDuty = data.bodycamAutoDuty;
 			if (typeof data.defaultTab === "string") defaultTab = data.defaultTab;
 			if (data.reducedMotion !== undefined) reducedMotion = data.reducedMotion;
 		} catch {
@@ -186,8 +202,12 @@
 				centerOnSelf,
 				patrolZoneNotifications,
 				autoStatusNotifications,
+				plateCheckAlerts,
+				plateCheckIgnoreImpounds,
+				plateCheckCriticalOnly,
 				autoWaypoint,
 				assignmentNotifications,
+				bodycamAutoDuty,
 				defaultTab,
 				reducedMotion,
 			};
@@ -387,9 +407,19 @@
 						<span class="toggle-slider"></span>
 					</label>
 				</div>
+				<div class="setting-row">
+					<div class="setting-info">
+						<span class="setting-label">Bodycam Follows Duty</span>
+						<span class="setting-desc">Switch your bodycam on when you go on duty and off when you go off. Manual changes are always logged.</span>
+					</div>
+					<label class="toggle">
+						<input type="checkbox" bind:checked={bodycamAutoDuty} />
+						<span class="toggle-slider"></span>
+					</label>
+				</div>
 			</div>
 
-			<div class="settings-card settings-card--full">
+			<div class="settings-card">
 				<div class="card-head">
 					<span class="material-icons card-icon">map</span>
 					<span class="card-label">Map</span>
@@ -415,6 +445,43 @@
 					</div>
 					<label class="toggle">
 						<input type="checkbox" bind:checked={centerOnSelf} />
+						<span class="toggle-slider"></span>
+					</label>
+				</div>
+			</div>
+
+			<div class="settings-card">
+				<div class="card-head">
+					<span class="material-icons card-icon">pin_invoke</span>
+					<span class="card-label">Plate Checks</span>
+				</div>
+				<div class="setting-row">
+					<div class="setting-info">
+						<span class="setting-label">Plate Check Alerts</span>
+						<span class="setting-desc">Receive dispatch alerts when a scanned plate is flagged</span>
+					</div>
+					<label class="toggle">
+						<input type="checkbox" bind:checked={plateCheckAlerts} />
+						<span class="toggle-slider"></span>
+					</label>
+				</div>
+				<div class="setting-row">
+					<div class="setting-info">
+						<span class="setting-label">Ignore Impound History</span>
+						<span class="setting-desc">Stay quiet when a repeat impound record is the only thing flagged</span>
+					</div>
+					<label class="toggle">
+						<input type="checkbox" bind:checked={plateCheckIgnoreImpounds} />
+						<span class="toggle-slider"></span>
+					</label>
+				</div>
+				<div class="setting-row">
+					<div class="setting-info">
+						<span class="setting-label">Critical Hits Only</span>
+						<span class="setting-desc">Only BOLOs, stolen vehicles and wanted owners — skip paperwork flags</span>
+					</div>
+					<label class="toggle">
+						<input type="checkbox" bind:checked={plateCheckCriticalOnly} />
 						<span class="toggle-slider"></span>
 					</label>
 				</div>
@@ -506,11 +573,14 @@
 	.settings-scroll::-webkit-scrollbar-track { background: transparent; }
 	.settings-scroll::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.06); border-radius: 2px; }
 
+	/* Multi-column rather than a 2-column grid: the browser distributes the
+	   cards so both columns end at roughly the same height, whatever they
+	   contain. A grid pairs cards by DOM order instead, so one card growing —
+	   or a new one appearing — left the opposite column empty and needed the
+	   order rebalancing by hand every time. This cannot drift. */
 	.settings-grid {
-		display: grid;
-		grid-template-columns: 1fr 1fr;
-		gap: 12px;
-		align-items: start;
+		column-count: 2;
+		column-gap: 12px;
 	}
 
 	.settings-card {
@@ -518,8 +588,12 @@
 		border: 1px solid rgba(255, 255, 255, 0.05);
 		border-radius: 6px;
 		padding: 12px 14px;
+		/* A card must never be torn across the column break, and spacing now
+		   comes from the card itself since there is no grid gap any more. */
+		break-inside: avoid;
+		-webkit-column-break-inside: avoid;
+		margin-bottom: 12px;
 	}
-	.settings-card--full { grid-column: 1 / -1; }
 
 	.card-head {
 		display: flex;
@@ -739,7 +813,6 @@
 	}
 
 	@media (max-width: 900px) {
-		.settings-grid { grid-template-columns: 1fr; }
-		.settings-card--full { grid-column: 1; }
+		.settings-grid { column-count: 1; }
 	}
 </style>

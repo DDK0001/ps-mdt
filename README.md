@@ -336,6 +336,54 @@ Config.CivilianAccess.payImpounds = true
 
 Citizens then see their impounded vehicles in the civilian MDT with the fee itemised (impound fee + accrued storage), any hold that's in force, and a button to pay. Paying does **not** release the vehicle — an officer still does that.
 
+### Bodycams
+
+Officers control their own bodycam with `/bodycam`, or the toggle in the Bodycams tab. **Switching it off is deliberately not blocked — it is recorded.** Every state change lands in the audit log with who, when and why, and shows up on the officer's activity timeline in the Roster — no separate history view needed.
+
+```lua
+Config.Bodycam = {
+    Command = 'bodycam',
+    AutoDutyDefault = true,       -- default for the Settings preference
+    NotifyOfficer = true,
+}
+```
+
+An officer can only ever change their own camera: the server keys the state to the caller's citizenid and accepts no target, so there is no path to switching off someone else's.
+
+Settings has a **Bodycam Follows Duty** preference: on by default, it switches the camera on at duty start and off at duty end, logged as `duty_on` / `duty_off` rather than `manual`. Turning a bodycam off cuts any live viewer immediately.
+
+History is stored in the existing `mdt_audit_logs` table rather than a table of its own — the audit log already carries actor, name, timestamp and a details blob, so the callsign and reason ride along in `details`. Because the Roster's activity timeline already reads that table by `actor_citizenid`, bodycam entries appear there automatically; entries carry an `action_label` so they read as "Bodycam deactivated manually" rather than a raw action name. No new table, no migration, no extra view.
+
+Note that `bodycam_on` / `bodycam_off` are intentionally left out of `Config.AuditTracking`'s category map. Unmapped actions are always recorded, which is the point: the record of a bodycam being switched off must not itself be switchable off from Settings.
+
+### Camera tampering
+
+Cameras can be shot out. A downed camera drops off the live feed list in the MDT (no View button) and comes back on its own after a cooldown.
+
+```lua
+Config.CameraTamper = {
+    Enabled = true,
+    HitRadius = 2.0,        -- metres from the bullet impact to the camera
+    OfflineMs = 600000,     -- 10 minutes down
+    RequireFirearm = true,
+    EmitEvent = true,       -- fires ps-mdt:server:cameraTampered
+    ReportsPerWindow = 12,  -- per-player throttle on impact reports
+    ReportWindowMs = 1000,
+}
+```
+
+**Officers cannot toggle cameras from the MDT by design** — a camera goes down because someone put a bullet in it.
+
+Detection reads the shooter's last bullet impact position rather than watching an entity, so it covers player-placed cameras (which spawn a prop) *and* virtual cameras mapped onto existing world models through one code path. Impacts are validated server-side, so camera positions never reach the client: a client only reports where its own bullet landed, and implausible claims (an impact far from the shooter) are rejected.
+
+To route the alert into a dispatch system, listen for the event rather than expecting the MDT to call your resource:
+
+```lua
+AddEventHandler('ps-mdt:server:cameraTampered', function(data)
+    -- data: camId, label, coords, offlineMs, suspectSource, suspectCitizenId, suspectName
+end)
+```
+
 ### Applications (civilian job applications)
 
 Civilians apply for a department in-game. Each department has its own command, so the applicant lands straight on the right form:
@@ -403,6 +451,79 @@ Config.DepartmentBanking = {
 `args` is the call signature: `'account'`, `'amount'` and `'reason'` are substituted, anything else is passed through as written — so a banking script that wants its arguments in a different order, or extra ones, is a config change rather than a code change. Presets for Renewed-Banking, okokBanking and qb-management are in the config comments; `Method = 'custom'` takes a Lua function for anything else (ESX society accounts, for instance).
 
 The department is recorded **with the impound**, not looked up when the fee is paid — an owner can settle the bill days later with nobody from that shift online. A failed deposit is logged loudly but never reverses the citizen's payment: that's a bookkeeping problem, not a transaction to roll back.
+
+## MDT plate checks
+
+Adds an automatic lookup against the MDT database (BOLO, reported stolen,
+owner's warrants, impound history, insurance/registration) to any radar or
+ANPR script. Hits are delivered to the scanning officer as a ps-dispatch
+alert.
+
+### Client (in your radar script)
+
+```lua
+-- Send each plate at most once per COOLDOWN. Without this guard a scanner
+-- running every frame fires hundreds of events per minute — the bottleneck
+-- is the network, not the database.
+local COOLDOWN = 120000 -- ms, mirrors Config.PlateCheck.alertCooldown
+local seen = {}
+
+--- Call this whenever your radar reads or locks a plate.
+function CheckPlateWithMDT(plate)
+    if type(plate) ~= 'string' or plate == '' then return end
+    plate = plate:gsub('%s+', ''):upper()
+
+    local now = GetGameTimer()
+    if seen[plate] and (now - seen[plate]) < COOLDOWN then return end
+
+    -- Prune while writing so the table doesn't grow over a long shift.
+    for known, at in pairs(seen) do
+        if (now - at) >= COOLDOWN then seen[known] = nil end
+    end
+    seen[plate] = now
+
+    TriggerServerEvent('myradar:checkPlate', plate, GetEntityCoords(PlayerPedId()))
+end
+```
+
+### Server (in your radar script)
+
+```lua
+RegisterNetEvent('myradar:checkPlate', function(plate, coords)
+    local src = source
+    if type(plate) ~= 'string' or #plate > 16 then return end
+
+    -- CreateThread because the export runs database queries: this keeps the
+    -- event handler from blocking. ps-mdt does the job check, caches the
+    -- result and throttles the alerts itself — nothing else is needed here.
+    CreateThread(function()
+        exports['ps-mdt']:PlateCheckAlert(src, plate, coords)
+    end)
+end)
+```
+
+### Lookup without an alert
+
+If the radar shows the hits in its own UI:
+
+```lua
+CreateThread(function()
+    local result = exports['ps-mdt']:CheckPlate(plate, src) -- src applies the job check
+    -- result.denied   -> player is not allowed to run plates
+    -- result.hits     -> { { key, label, detail, severity }, ... }
+    -- result.severity -> 'critical' | 'warning' | nil
+    -- result.model    -> "Karin Sultan", result.owner -> owner name
+end)
+```
+
+### After changing records
+
+Results are cached for up to `Config.PlateCheck.cacheSeconds`. To make a
+freshly created BOLO take effect immediately:
+
+```lua
+exports['ps-mdt']:InvalidatePlateCache(plate) -- no argument clears everything
+```
 
 ### Audit log retention
 

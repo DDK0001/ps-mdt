@@ -151,13 +151,48 @@ Config.Fuel = 'LegacyFuel' -- Fuel resource name for vehicle fuel management
 -- phone resource once and both features use it, so they can never drift apart.
 -- Leave Resource = '' to use charinfo.phone for display and disable court SMS/mail.
 Config.Phone = {
-    Resource     = 'lb-phone',                    -- phone script resource name ('' = charinfo.phone only, no SMS/mail)
-    NumberExport = 'GetEquippedPhoneNumber',      -- export returning a citizen's number for a citizenid
-    UseCharinfoFallback = true,                   -- if the export returns nothing, fall back to charinfo.phone
+    -- Which phone script does your server run? Set this one value:
+    --
+    --   'lb-phone'          lb-phone
+    --   'jpr-phonesystem'   JPR Phone System
+    --   'yseries'           YSeries (teamsgg)
+    --   'none'              no phone script — court SMS and e-mails are off,
+    --                       phone numbers come from the character's charinfo
+    --   'custom'            something else — see the Custom block at the end
+    --
+    -- Nothing else needs changing to switch: how each script has to be called
+    -- is handled in server/backend/phone.lua.
+    Provider = 'lb-phone',
 
-    -- Court messaging (uses the same Resource above)
-    SmsSenderNumber = 'SA-COURT',                 -- "from" number shown on reminder SMS (any string lb-phone accepts)
-    MailSender      = 'San Andreas Judicial System', -- sender shown in the recipient's inbox
+    -- Use the character's charinfo.phone when the phone script has no number
+    -- for them. Leave this on — JPR Phone cannot look up another player's
+    -- number at all, so with it off court SMS have no address to send to.
+    UseCharinfoFallback = true,
+
+    -- Shown as the sender on court messages.
+    SmsSenderNumber = 'SA-COURT',                    -- "from" on reminder SMS
+    MailSender      = 'San Andreas Judicial System', -- sender in the inbox
+
+    -- Worth knowing per script:
+    --   JPR Phone — its SMS export runs on the player's client, so reminder
+    --     SMS only reach players who are ONLINE. Its e-mails do reach offline
+    --     players, so keep Config.Court.Email enabled.
+    --   YSeries — reminders arrive as a phone notification, which is
+    --     addressed by server id and therefore reaches ONLINE players only;
+    --     its e-mails reach everyone, so keep Config.Court.Email enabled.
+    --     E-mails and number lookups need no setup.
+
+    -- ── Only for Provider = 'custom' ─────────────────────────────────────────
+    -- Everything above is enough for the built-in options. This is for a phone
+    -- script that is not listed; leave it untouched otherwise. The field
+    -- reference is at the top of server/backend/phone.lua, next to the
+    -- built-in definitions you can copy from.
+    Custom = {
+        Resource = '',
+        Number = { kind = 'none' },
+        Sms    = { kind = 'none' },
+        Mail   = { kind = 'none' },
+    },
 }
 
 
@@ -344,6 +379,26 @@ Config.Housing = {
                 columns = {                                -- pull these fields from the joined table instead
                     name   = 'label',
                     coords = 'coords',
+                },
+            },
+        },
+
+        -- added by cheeseburger.apocalypse, thank u <3
+        nolag_properties = {
+            table = 'properties_owners',
+            columns = {
+                owner      = 'identifier',
+                id         = 'property_id',
+                name       = nil,
+                coords     = nil,       -- disabled: metadata isn't a flat {x,y,z}, so "set waypoint" won't show
+                keyholders = nil,
+            },
+            join = {
+                table   = 'properties',
+                on      = { left = 'property_id', right = 'id' },
+                columns = {
+                    name       = 'label',
+                    keyholders = 'keyholders',
                 },
             },
         },
@@ -596,6 +651,85 @@ Config.MedicalJobs = {
     'ambulance',
 }
 
+-- ── Plate checks (ANPR / radar) ──────────────────────────────────────────────
+-- Lets a plate scanner ask the MDT what it knows about a plate, and pushes a
+-- ps-dispatch alert to the scanning officer when something is worth stopping
+-- for. Hook it up from your radar resource:
+--
+--     exports['ps-mdt']:PlateCheckAlert(source, plate, coords)  -- look up + alert
+--     local res = exports['ps-mdt']:CheckPlate(plate)           -- look up only
+--
+-- The lookup works without ps-dispatch; only the alert is skipped then.
+Config.PlateCheck = {
+    -- Chat command for manual checks and testing. false disables it.
+    command = 'checkplate',
+
+    -- Job types allowed to run plate checks. CheckAuth (the MDT's general
+    -- access gate) also accepts EMS and DOJ, which have no business querying
+    -- plates — so this narrows it to police only by default. Add job types to
+    -- widen it, or set to false to allow everyone CheckAuth accepts.
+    allowedJobTypes = { Config.PoliceJobType },
+
+    -- Write an entry to mdt_audit_logs so who ran which plate stays
+    -- reviewable. Only scans that actually ALERT are logged: a continuous
+    -- radar passes hundreds of plates a minute and logging each one would
+    -- bury the interesting queries and out-write the rest of the MDT.
+    audit = true,
+    auditEveryScan = false, -- true: log every single scan (write-heavy)
+
+    -- ── Built for continuous scanning ────────────────────────────────────
+    -- Repeat lookups of the same plate are answered from memory for this
+    -- long instead of hitting the database again. Concurrent lookups of one
+    -- plate additionally share a single query.
+    -- Rough sizing: one entry per distinct plate seen within cacheSeconds,
+    -- shared across ALL officers. On a busy 500-slot server with 30 units
+    -- scanning, 2000 is comfortable (a few hundred KB); raise cacheSeconds
+    -- before raising the cap if the database is the bottleneck.
+    cacheSeconds = 60,
+    cacheMaxEntries = 2000,
+
+    -- Do not alert the same officer about the same plate again within this
+    -- many seconds. 0 disables the cooldown.
+    alertCooldown = 120,
+
+    -- Hard ceiling on plate alerts per officer per minute, so a street full
+    -- of flagged cars stays readable. 0 disables the ceiling.
+    maxAlertsPerMinute = 6,
+
+    -- Which flags are looked for, and how urgent a hit is.
+    -- 'critical' -> priority 1 alert (red card + urgent sound)
+    -- 'warning'  -> routine alert
+    checks = {
+        bolo         = { enabled = true,  severity = 'critical' },
+        stolen       = { enabled = true,  severity = 'critical' },
+        warrants     = { enabled = true,  severity = 'critical' }, -- owner wanted
+        -- Registered owner has no driver licence. Only an explicit `false` in
+        -- their metadata counts — a missing entry is treated as unknown, not
+        -- as unlicensed, so characters whose framework never wrote the key do
+        -- not all light up. (Compare Config.PlateScanForDriversLicense, which
+        -- does the same for the Wolfknight radar integration.)
+        driverLicense = { enabled = true, severity = 'warning' },
+        -- Impound HISTORY, not a yes/no: how often this vehicle has ended up
+        -- in a lot. Below minCount it stays quiet (one impound says nothing),
+        -- from criticalCount it counts as critical — as does a vehicle whose
+        -- record says it is currently held, since it should not be driving.
+        impounds     = { enabled = true,  severity = 'warning', minCount = 2, criticalCount = 5 },
+        insurance    = { enabled = true,  severity = 'warning'  }, -- needs Config.VehicleInsurance
+        registration = { enabled = true,  severity = 'warning'  }, -- needs Config.VehicleRegistration
+        unregistered = { enabled = false, severity = 'warning'  }, -- plate has no vehicle record at all
+    },
+
+    alert = {
+        enabled = true,
+        -- Stay silent on clean plates. Leave this true unless the scanner is
+        -- manually triggered: a ping on every passing car is noise within
+        -- minutes, and officers stop reading the alerts entirely.
+        silentWhenClean = true,
+        code = '10-28',   -- shown on the alert card
+        alertTime = 12,   -- seconds on screen
+    },
+}
+
 Config.Uploads = {
     MaxBytes = 5242880, -- 5 MB
     RateLimitPerMinute = 10, -- Max uploads per player per minute (0 = unlimited)
@@ -837,11 +971,35 @@ Config.ManagementPermissions = {
 
 -- Bodycam Settings (override defaults if needed, remove to use built-in defaults)
 Config.Bodycam = {
+    -- Where the bodycam lens sits, relative to the officer (metres, in the
+    -- ped's own local space: side = right, forward = ahead, height = up from
+    -- the ped's feet). Separate values while seated, since a driver sits
+    -- lower and closer to the windscreen than a standing officer.
+    -- Remove the whole Position block to use the built-in defaults.
+    Position = {
+        onFoot  = { side = 0.0, forward = 0.12, height = 0.45, pitch = -8.0 },
+        vehicle = { side = 0.0, forward = -0.02, height = 0.45, pitch = -4.0 },
+    },
+
+    -- Duty event wiring
     DutyEvent = 'QBCore:Server:OnJobUpdate',
     DutyEventMode = 'qbcore',
     MultiJobDutyEvent = 'ps-multijob:server:dutyChanged',
     DutyResource = 'qb-core',
     MultiJobResource = 'ps-multijob',
+
+    -- Officers control their own bodycam. Turning it off is deliberately NOT blocked —
+    -- it is recorded instead. Every change lands in mdt_bodycam_log with who, when and
+    -- why, readable in the MDT. Accountability rather than a lock.
+    Command = 'bodycam',
+
+    -- Default for the "switch automatically with duty" preference in Settings, used
+    -- until a player saves their own choice.
+    AutoDutyDefault = true,
+
+    -- Tell the officer when their bodycam changes state.
+    NotifyOfficer = true,
+
 }
 
 -- Officer Status (Map tab) ---------------------------------------------------
@@ -900,15 +1058,84 @@ Config.OfficerStatus = {
     },
 }
 
--- Optional defaults for role permissions by job/grade
+-- ---------------------------------------------------------------------------
+--  Department policy permissions
+-- ---------------------------------------------------------------------------
+-- Permissions that come WITH A RANK, the way a department's own regulations
+-- would grant them — not something a supervisor hands out in the Management
+-- tab. In the MDT they show up ticked and locked, labelled "Department Policy".
+--
 -- Example:
 -- Config.PermissionDefaults = {
 --     police = {
 --         ['0'] = { 'access_reports' },
---         ['1'] = { 'access_reports', 'view_bodycams' },
+--         ['1'] = { 'view_bodycams' },   -- sergeants and up, see Cumulative
 --     }
 -- }
 Config.PermissionDefaults = Config.PermissionDefaults or {}
+
+-- Ranks build on each other: a grade also gets everything the lower grades
+-- are granted. In the example above a grade 1 officer holds BOTH
+-- access_reports and view_bodycams, and grades you never list still inherit
+-- from below instead of ending up with nothing.
+-- Set to false if each grade should only get its own exact list.
+Config.PermissionDefaultsCumulative = true
+
+-- How policy interacts with what a boss configures in the Management tab:
+--
+--   'merge'          Policy always applies, on top of whatever is stored.
+--                    Add a permission here and every matching rank has it
+--                    immediately, including ranks saved months ago. Bosses
+--                    grant EXTRA permissions on top; they cannot revoke
+--                    policy ones. (Recommended, and what most people expect
+--                    the word "defaults" to mean.)
+--
+--   'seed'           The old behaviour: policy only fills in a rank that has
+--                    never been saved in the MDT. The first time a boss saves
+--                    that rank — even without changing anything — this config
+--                    stops affecting it for good.
+--
+--   'authoritative'  Policy is the only source. The Management tab becomes
+--                    read-only in effect; for servers that manage permissions
+--                    in this file exclusively.
+Config.PermissionDefaultsMode = 'merge'
+
+-- ---------------------------------------------------------------------------
+--  Camera tampering
+-- ---------------------------------------------------------------------------
+-- Cameras can be shot out. Detection works off the shooter's last bullet impact
+-- position rather than an entity, so it covers BOTH player-placed cameras (which spawn a
+-- prop) and virtual cameras mapped onto existing world models, with one code path and no
+-- dependency on any other resource.
+--
+-- Officers cannot toggle cameras from the MDT by design — a camera goes down because
+-- someone put a bullet in it, and comes back on its own after a cooldown.
+Config.CameraTamper = {
+    Enabled = true,
+
+    -- How close a bullet impact must land to count as a hit on the camera, in metres.
+    -- Generous enough to feel fair, tight enough that stray rounds don't kill cameras.
+    HitRadius = 2.0,
+
+    -- How long a camera stays down after being shot.
+    OfflineMs = 600000,   -- 10 minutes
+
+    -- Only count impacts from actual firearms (melee/explosions ignored).
+    RequireFirearm = true,
+
+    -- Fire `ps-mdt:server:cameraTampered` so a server can route the alert into whatever
+    -- dispatch it runs. The MDT itself doesn't call into another resource.
+    EmitEvent = true,
+
+    -- Client-side gap between two reported shots. CEventGunShot fires per round, so this
+    -- keeps sustained automatic fire from reporting every single one. Short enough that a
+    -- follow-up shot at a camera still counts.
+    ReportCooldownMs = 250,
+
+    -- Server-side throttle on impact reports, per player, as a second line of defence.
+    ReportsPerWindow = 12,
+    ReportWindowMs = 1000,
+}
 
 -- ---------------------------------------------------------------------------
 --  Applications (civilian job applications)
@@ -930,7 +1157,7 @@ Config.Applications = {
     },
 
     -- Anti-spam: how long a citizen must wait between submissions to the SAME department.
-    CooldownMs = 600000,   -- 10 minutes
+    CooldownMs = 300000,   -- 5 minutes
 
     -- Message the applicant on accept/reject (needs lb-phone or your mail bridge).
     NotifyOnDecision = true,

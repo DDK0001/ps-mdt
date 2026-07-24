@@ -2,6 +2,25 @@ local resourceName = tostring(GetCurrentResourceName())
 local bodycamInstances = {}
 local bodycamViewers = {}
 
+-- Bodycam power state, keyed by citizenid rather than by session source so it survives a
+-- reconnect within the same shift. A missing entry means "on": a bodycam is running
+-- unless its officer deliberately switched it off.
+local bodycamPower = {}
+
+--- Is this officer's bodycam currently running?
+local function isBodycamOn(citizenid)
+    if not citizenid then return true end
+    return bodycamPower[citizenid] ~= false
+end
+
+--- Read-only accessor for other modules (the map/tracking payload needs to know whether
+--- an officer's bodycam is actually recording). The power table itself stays file-local.
+---@param citizenid string
+---@return boolean
+function IsOfficerBodycamOn(citizenid)
+    return isBodycamOn(citizenid)
+end
+
 local function getBodycamConfig()
     return Config and Config.Bodycam or {}
 end
@@ -60,6 +79,64 @@ local function getOnDutyOfficers()
 end
 
 -- Get all bodycams for on-duty officers
+-- Helper function to create bodycam for officer
+local function createOfficerBodycam(playerId, playerData)
+    local bodycamId = tostring(playerId)
+    local officerName = playerData.charinfo.firstname .. ' ' .. playerData.charinfo.lastname
+
+    bodycamInstances[bodycamId] = {
+        id = bodycamId,
+        officerName = officerName,
+        callsign = (playerData.metadata and playerData.metadata.callsign) or 'Unknown',
+        rank = (playerData.job and playerData.job.grade and playerData.job.grade.name) or 'Officer',
+        playerId = playerId,
+        citizenid = playerData.citizenid,
+        createdAt = os.time()
+    }
+
+    ps.debug('Created bodycam for officer:', officerName, 'ID:', bodycamId)
+end
+
+-- Helper function to remove bodycam for officer
+local function removeOfficerBodycam(playerId)
+    local bodycamId = tostring(playerId)
+
+    if bodycamInstances[bodycamId] then
+        bodycamInstances[bodycamId] = nil
+        ps.debug('Removed bodycam for officer going off duty:', playerId)
+    end
+end
+
+-- Bodycam ids are the officer's server id as a STRING (see
+-- createOfficerBodycam). Callers pass whatever their UI happened to hold —
+-- the Bodycams tab sends the string, the dispatch map popup a number — and in
+-- Lua a numeric key never matches a string one, so normalize every lookup.
+local function normalizeBodycamId(id)
+    if type(id) == 'table' then id = id.id or id.bodycamId end
+    if id == nil or id == '' then return nil end
+    return tostring(id)
+end
+
+-- The registry is filled lazily (by getBodycams, i.e. opening the Bodycams
+-- tab) and on duty CHANGES. An officer already on duty when the viewer joined
+-- — or when the resource restarted — therefore has no entry yet, and viewing
+-- them failed with "Bodycam not found" until someone opened that tab once.
+-- Rebuild on demand instead.
+local function resolveBodycam(bodycamId)
+    if not bodycamId then return nil end
+    if bodycamInstances[bodycamId] then return bodycamInstances[bodycamId] end
+
+    for _, player in pairs(getOnDutyOfficers() or {}) do
+        local pd = player.PlayerData
+        if pd and tostring(pd.source) == bodycamId then
+            createOfficerBodycam(pd.source, pd)
+            ps.debug('resolveBodycam: rebuilt missing instance for', bodycamId)
+            return bodycamInstances[bodycamId]
+        end
+    end
+    return nil
+end
+
 ps.registerCallback(resourceName .. ':server:getBodycams', function(source)
     local src = source
     ps.debug('getBodycams called by source:', src)
@@ -88,7 +165,7 @@ ps.registerCallback(resourceName .. ':server:getBodycams', function(source)
                     callsign = playerData.metadata and playerData.metadata.callsign or 'Unknown',
                     rank = playerData.job.grade and playerData.job.grade.name or 'Officer',
                     playerId = playerData.source,
-                    isOnline = true,
+                    citizenid = playerData.citizenid,
                     createdAt = os.time()
                 }
                 ps.debug('Created bodycam on-demand for officer:', officerName, 'ID:', bodycamId)
@@ -144,7 +221,10 @@ ps.registerCallback(resourceName .. ':server:getBodycams', function(source)
                 officerName = data.officerName,
                 callsign = data.callsign,
                 rank = data.rank,
-                isOnline = true,
+                citizenid = data.citizenid,
+                -- The real state now, not a constant: a bodycam listed here belongs to an
+                -- on-duty officer, but it may well be switched off.
+                isOnline = isBodycamOn(data.citizenid),
                 viewerCount = viewerCount,
             })
             ps.debug('getBodycams: Added bodycam to return list:', bodycamId, 'with', viewerCount, 'viewers')
@@ -166,9 +246,17 @@ ps.registerCallback(resourceName .. ':server:viewBodycam', function(source, body
         return { success = false, error = "Unauthorized" }
     end
 
-    local bodycamData = bodycamInstances[bodycamId]
+    bodycamId = normalizeBodycamId(bodycamId)
+    local bodycamData = resolveBodycam(bodycamId)
     if not bodycamData then
         return { success = false, error = "Bodycam not found" }
+    end
+
+    -- A switched-off bodycam has nothing to show; say so instead of opening a
+    -- live feed the officer believes is off. The toggle stays logged either
+    -- way (see setBodycamPower) — this is only about what a viewer sees.
+    if not isBodycamOn(bodycamData.citizenid) then
+        return { success = false, error = "This officer's bodycam is switched off" }
     end
 
     local targetSource = bodycamData.playerId
@@ -242,6 +330,8 @@ end)
 RegisterNetEvent(resourceName .. ':server:deactivateBodycam', function(bodycamId)
     local playerId = source
     if not CheckAuth(playerId) then return end
+    bodycamId = normalizeBodycamId(bodycamId)
+    if not bodycamId then return end
     ps.debug('Deactivating bodycam for player:', playerId, 'Bodycam ID:', bodycamId)
 
     if bodycamViewers[bodycamId] then
@@ -263,34 +353,6 @@ RegisterNetEvent(resourceName .. ':server:deactivateBodycam', function(bodycamId
         ps.debug('No viewer table found for bodycam:', bodycamId)
     end
 end)
-
--- Helper function to create bodycam for officer
-local function createOfficerBodycam(playerId, playerData)
-    local bodycamId = tostring(playerId)
-    local officerName = playerData.charinfo.firstname .. ' ' .. playerData.charinfo.lastname
-
-    bodycamInstances[bodycamId] = {
-        id = bodycamId,
-        officerName = officerName,
-        callsign = (playerData.metadata and playerData.metadata.callsign) or 'Unknown',
-        rank = (playerData.job and playerData.job.grade and playerData.job.grade.name) or 'Officer',
-        playerId = playerId,
-        isOnline = true,
-        createdAt = os.time()
-    }
-
-    ps.debug('Created bodycam for officer:', officerName, 'ID:', bodycamId)
-end
-
--- Helper function to remove bodycam for officer
-local function removeOfficerBodycam(playerId)
-    local bodycamId = tostring(playerId)
-
-    if bodycamInstances[bodycamId] then
-        bodycamInstances[bodycamId] = nil
-        ps.debug('Removed bodycam for officer going off duty:', playerId)
-    end
-end
 
 -- Listen for QBCore duty status changes
 local function handleDutyChange(playerId, job, onDuty, employeeData)
@@ -426,3 +488,106 @@ CreateThread(function()
 end)
 
 registerDutyEvents()
+-- ── Officer-controlled power ─────────────────────────────────────────────────
+-- An officer may switch their own bodycam off. That is not blocked: it is recorded,
+-- and supervisors can read the record. Nobody can toggle anyone else's — the state is
+-- always keyed to the caller's own citizenid, never to an id from the payload.
+
+local function bodycamCfg()
+    return (Config and Config.Bodycam) or {}
+end
+
+---@param reason string 'manual' | 'duty_on' | 'duty_off'
+---@param desired boolean|nil nil = flip the current state
+local function setBodycamPower(src, desired, reason)
+    local citizenid = ps.getIdentifier(src)
+    if not citizenid then return nil end
+
+    local current = isBodycamOn(citizenid)
+    local target = desired
+    if target == nil then target = not current end
+    if target == current then return current end
+
+    bodycamPower[citizenid] = target
+
+    -- The audit log is the record. It already carries actor, name, timestamp and a JSON
+    -- details blob, so a dedicated bodycam table would only duplicate it — the callsign
+    -- and the reason ride along in `details`.
+    local callsign = ps.getMetadata and ps.getMetadata(src, 'callsign') or nil
+
+    -- action_label is what the roster's activity timeline prints when present, so the
+    -- entry reads as a sentence instead of "bodycam off".
+    local why = ({
+        manual   = 'manually',
+        duty_on  = 'on going on duty',
+        duty_off = 'on going off duty',
+    })[reason or 'manual'] or 'manually'
+
+    if ps.auditLog then
+        -- Written on its own thread: ps.auditLog ends in a blocking MySQL insert, and
+        -- holding the toggle's reply for it stalls the NUI callback queue behind it.
+        -- Nothing here depends on the write finishing.
+        local label = (target and 'Bodycam activated ' or 'Bodycam deactivated ') .. why
+        CreateThread(function()
+            pcall(ps.auditLog, src, target and 'bodycam_on' or 'bodycam_off', 'bodycam', citizenid, {
+                reason = reason or 'manual',
+                callsign = callsign,
+                action_label = label,
+            })
+        end)
+    end
+
+    -- Anyone currently watching this feed loses it. Targeted at those viewers only —
+    -- a broadcast to -1 made every client in the server reload their bodycam list.
+    if not target then
+        local bodycamId = tostring(src)
+        for viewerId in pairs(bodycamViewers[bodycamId] or {}) do
+            TriggerClientEvent(resourceName .. ':client:bodycamPowerOff', viewerId, { id = bodycamId })
+        end
+    end
+
+    return target
+end
+
+-- Toggle own bodycam. No target parameter by design.
+ps.registerCallback(resourceName .. ':server:toggleBodycam', function(source, payload)
+    if bodycamCfg().Enabled == false then return { success = false, message = 'Bodycams are disabled' } end
+    if not CheckAuth(source) then return { success = false, message = 'Unauthorized' } end
+
+    payload = payload or {}
+    local desired = nil
+    if type(payload.on) == 'boolean' then desired = payload.on end
+
+    local state = setBodycamPower(source, desired, 'manual')
+    if state == nil then return { success = false, message = 'Could not resolve officer' } end
+    return { success = true, isOnline = state }
+end)
+
+-- Read own current state (for the toggle's initial rendering).
+ps.registerCallback(resourceName .. ':server:getMyBodycam', function(source)
+    if not CheckAuth(source) then return { success = false } end
+    local citizenid = ps.getIdentifier(source)
+    return { success = true, isOnline = isBodycamOn(citizenid), citizenid = citizenid }
+end)
+
+-- Automatic switching with duty, driven by the officer's own preference. The client
+-- decides whether to call this (the preference lives in the NUI), the server stays the
+-- authority on the state itself.
+RegisterNetEvent(resourceName .. ':server:bodycamDutyChange', function(onDuty)
+    local src = source
+    if bodycamCfg().Enabled == false then return end
+    if not CheckAuth(src) then return end
+    setBodycamPower(src, onDuty == true, onDuty and 'duty_on' or 'duty_off')
+end)
+
+-- Free the state when the player disconnects so the table doesn't grow unbounded. The
+-- log keeps the history; this is only the live flag.
+AddEventHandler('playerDropped', function()
+    -- The player is already disconnected here, so resolving their identifier can fail
+    -- depending on the framework's teardown order.
+    local src = source
+    local ok, citizenid = pcall(function()
+        return ps.getIdentifier and ps.getIdentifier(src) or nil
+    end)
+    if ok and citizenid then bodycamPower[citizenid] = nil end
+end)

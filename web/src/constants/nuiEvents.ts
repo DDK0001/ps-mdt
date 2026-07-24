@@ -263,10 +263,16 @@ export const NUI_EVENTS = {
 	CAMERA: {
 		GET_CAMERAS: "getCameras",
 		VIEW_CAMERA: "viewCamera",
+		// Pushed from the client when a camera goes down (or comes back).
+		CAMERA_STATUS_CHANGED: "cameraStatusChanged",
 	},
 	BODYCAM: {
 		GET_BODYCAMS: "getBodycams",
 		VIEW_BODYCAM: "viewBodycam",
+		// Officer-controlled power + history
+		TOGGLE_BODYCAM: "toggleBodycam",
+		GET_MY_BODYCAM: "getMyBodycam",
+		BODYCAM_POWER_OFF: "bodycamPowerOff",
 	},
 	MAP: {
 		GET_TRACKING:       "getTracking",
