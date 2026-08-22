@@ -195,6 +195,50 @@ Config.Phone = {
     },
 }
 
+-- ═══════════════════════════════════════════════════════════════════════════
+--  Phone tracking
+--  Locating a phone is surveillance, so it runs on a warrant: an officer
+--  submits the number with a justification, a judge approves or denies it, and
+--  only then does the phone report in. The position is deliberately imprecise
+--  and the track expires on its own — nobody has to remember to switch it off.
+-- ═══════════════════════════════════════════════════════════════════════════
+Config.PhoneTracking = {
+    Enabled = true,
+ 
+    -- Judicial approval. Turning this off grants the request immediately, but
+    -- the officer still has to execute it — the warrant step is skipped, not
+    -- the trigger. A policy decision for your server, not a convenience
+    -- setting; the audit log records it either way.
+    RequireApproval = true,
+ 
+    -- How long a granted warrant stays executable, in seconds. Approval does
+    -- not start anything: the officer runs the track themselves, when they are
+    -- actually in a position to act on it. This is the window they have to do
+    -- that in — an approval read in the morning should not still authorise
+    -- surveillance that evening. Unused warrants lapse and need a new request.
+    ApprovalValidFor = 7200,  -- 2 hours
+ 
+    -- How long an approved track runs, in seconds, and how far apart the
+    -- pings are. With the defaults that is three pings: one on approval and
+    -- one a minute later, then a third, then the track expires. Enough to see
+    -- roughly where somebody is and which way they are moving, without
+    -- turning into a live feed.
+    Duration     = 180,
+    PingInterval = 60,
+ 
+    -- Radius in metres the reported position is scattered within. This is what
+    -- makes it a rough fix rather than a GPS lock — the marker on the map is
+    -- drawn at this size, so officers can see the uncertainty instead of
+    -- having to be told about it.
+    Accuracy = 150,
+ 
+    -- How many tracks may run at once, server-wide.
+    MaxActive = 3,
+ 
+    -- Keep expired tracks and their pings for this many days, then delete.
+    -- Surveillance records should not accumulate forever.
+    RetentionDays = 14,
+}
 
 -- Callsigns
 -- Officers pick a callsign from a grid rather than typing one, so the range has to be
@@ -891,6 +935,43 @@ Config.Dashcam = {
     },
 }
 
+Config.TabletCam = {
+    -- Master switch. false = MDT behaves exactly like before.
+    Enabled = true,
+ 
+    -- Blend times in ms
+    Duration     = 900,  -- gameplay cam -> tablet
+    ExitDuration = 700,  -- tablet -> gameplay cam
+ 
+    -- Block driving / exiting / combat while the tablet is open.
+    -- Set to false if your server wants passengers to keep control.
+    DisableDriving = true,
+ 
+    -- Hide the minimap while the tablet cam is up
+    HideRadar = true,
+ 
+    -- Anchor bone. Change to 'seat_pside_f' if you want the passenger side.
+    SeatBone = 'seat_dside_f',
+ 
+    -- Used when the model has no seat bone (rare, mostly on badly ported cars)
+    SeatFallback = vec3(-0.35, 0.20, 0.62),
+ 
+    -- Applied on top of the seat bone, so this one entry fits most vehicles.
+    -- offset: x = right, y = forward, z = up   |   rot: pitch, roll, yaw
+    Base = {
+        offset = vec3(0.430, 0.150, 0.440),
+        rot    = vec3(-26.0, 0.0, -19.5),
+        fov    = 45.0,
+    },
+ 
+    -- Only add models where the base values actually look wrong.
+    -- Generate these lines in game with /mdtcamtune -> E (see tablet_cam_tune.lua)
+    Overrides = {
+        [`police5`] = { offset = vec3(0.430, 0.150, 0.440), rot = vec3(-26.0, 0.0, -19.5), fov = 45.0 },
+        -- [`sheriff2`] = { offset = vec3(...), rot = vec3(...), fov = 45.0 },
+    },
+}
+
 -- Management permissions and defaults (per job grade)
 Config.ManagementPermissions = {
     -- Citizens
@@ -1246,6 +1327,10 @@ Config.DepartmentBanking = {
         --   resource = 'qb-management', method = 'AddMoney',
         --   args = { 'account', 'amount' }
         --
+        -- tgg-banking:
+        -- resource = 'tgg-banking', method   = 'AddSocietyMoney',
+        -- args     = { 'account', 'amount' },
+        --
         -- esx_addonaccount is not an export — use Method = 'custom' below.
     },
 
@@ -1438,47 +1523,39 @@ Config.Court = {
         { id = 'ems_on_duty',   label = 'On-Duty EMS',    role = 'attendee', domain = 'ems', jobType = Config.MedicalJobType, onlyOnDuty = true },
     },
 }
+
 -- ═══════════════════════════════════════════════════════════════════════════
 --  Radio in MDT
---  Lets players push-to-talk on the radio while the MDT is open. Because the
---  MDT holds full NUI focus (keyboard goes to the UI, not the game), the UI
---  itself captures the PTT key and forwards it to the client, which drives the
---  active voice system. No extra RegisterKeyMapping is added — where possible
---  the player's EXISTING radio keybind is detected and reused.
+--  Lets players talk on the radio while the MDT is open. Because the MDT holds
+--  full NUI focus, the game never sees a keypress — so instead of guessing at
+--  the player's radio keybind, the MDT shows its own push-to-talk button in the
+--  top bar. Hold it to transmit, release to stop. No keybind, nothing to
+--  configure per player, and it works the same on every voice system.
 -- ═══════════════════════════════════════════════════════════════════════════
 Config.Radio = {
     Enabled = true,
-
+ 
     -- Which voice resource to drive:
     --   'auto'       → detect the first running one (order below in AutoDetect)
     --   'pma-voice' | 'saltychat' | 'yaca' → force a specific system
     VoiceSystem = 'auto',
-
-    -- Fallback PTT key the MDT listens for IF the real keybind can't be read
-    -- (browser KeyboardEvent value — a code like 'AltLeft'/'CapsLock' or a
-    -- single character like 'n'). Pick a non-text key to avoid clashing with
-    -- typing in reports. The real in-game radio key is auto-detected when
-    -- possible and takes priority over this.
-    PTTKey = 'AltLeft',
-
-    -- Per-system trigger + which command's key to read for the NUI listener.
+ 
+    -- Per-system trigger.
     --   type = 'command' → ExecuteCommand(start) / ExecuteCommand(stop)
     --   type = 'export'  → exports[resource][fn](state)
-    -- `keyCmd` is the keymapping command whose bound key we read (nil = use the
-    -- fallback PTTKey). `startCandidates` lets us match fork-renamed commands.
+    -- `startCandidates` lets us match fork-renamed commands; the first one that
+    -- is actually registered wins, and the stop command is derived from it.
     Systems = {
         ['pma-voice'] = {
             type = 'command',
             start = '+radiotalk',
             stop = '-radiotalk',
-            keyCmd = '+radiotalk',
             startCandidates = { '+radiotalk' },
         },
         ['saltychat'] = {
             type = 'command',
             start = '+primaryRadio',
             stop = '-primaryRadio',
-            keyCmd = '+primaryRadio',
             -- SaltyChat forks name this differently; first registered wins.
             startCandidates = { '+primaryRadio', '+radioPrimary', '+SaltyChat_RadioPrimary' },
         },
@@ -1486,12 +1563,9 @@ Config.Radio = {
             type = 'export',
             resource = 'yaca-voice',
             fn = 'radioTalkingStart',
-            -- YACA drives radio via an export; no stable command to read, so
-            -- the NUI listens for the fallback PTTKey (set it to your YACA key).
-            keyCmd = nil,
         },
     },
-
+ 
     -- 'auto' detection order: { system = key in Systems, resource = res name }.
     AutoDetect = {
         { system = 'pma-voice', resource = 'pma-voice' },
